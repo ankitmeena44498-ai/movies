@@ -1,95 +1,67 @@
+import aiosqlite
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+import os
 
-import sys
-import glob
-import importlib
-from pathlib import Path
-from pyrogram import idle
-import logging
-import logging.config
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+LOG_CHANNEL = os.getenv("LOG_CHANNEL")
 
-# Get logging configurations
-logging.config.fileConfig('logging.conf')
-logging.getLogger().setLevel(logging.INFO)
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
-logging.getLogger("imdbpy").setLevel(logging.ERROR)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logging.getLogger("aiohttp").setLevel(logging.ERROR)
-logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
+async def init_db():
+    async with aiosqlite.connect("files.db") as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, file_id TEXT)"
+        )
+        await db.commit()
 
+async def add_file(title: str, file_id: str):
+    async with aiosqlite.connect("files.db") as db:
+        await db.execute("INSERT INTO files (title, file_id) VALUES (?, ?)", (title, file_id))
+        await db.commit()
 
-from pyrogram import Client, __version__
-from pyrogram.raw.all import layer
-from database.ia_filterdb import Media
-from database.users_chats_db import db
-from info import *
-from utils import temp
-from typing import Union, Optional, AsyncGenerator
-from pyrogram import types
-from Script import script 
-from datetime import date, datetime 
-import pytz
-from aiohttp import web
-from plugins import web_server
+async def search_files(query: str):
+    async with aiosqlite.connect("files.db") as db:
+        async with db.execute("SELECT title, file_id FROM files WHERE title LIKE ?", (f"%{query}%",)) as cursor:
+            return await cursor.fetchall()
 
-import asyncio
-from pyrogram import idle
-from Jisshu.bot import JisshuBot
-from Jisshu.util.keepalive import ping_server
-from Jisshu.bot.clients import initialize_clients
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 I’m an Auto Filter Bot. Add me to your group and send a file to save it!")
 
-ppath = "plugins/*.py"
-files = glob.glob(ppath)
-JisshuBot.start()
-loop = asyncio.get_event_loop()
+async def save_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.document:
+        file = update.message.document
+        await add_file(file.file_name, file.file_id)
+        await update.message.reply_text(f"✅ File saved: {file.file_name}")
+        await context.bot.send_message(LOG_CHANNEL, f"📂 File Saved:\n{file.file_name}\nBy: {update.effective_user.id}")
 
+async def search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text.strip()
+    results = await search_files(query)
+    if not results:
+        return
+    buttons = []
+    for title, file_id in results[:10]:
+        buttons.append([InlineKeyboardButton(title, callback_data=f"get_{file_id}")])
+    await update.message.reply_text(f"🔎 Results for: {query}", reply_markup=InlineKeyboardMarkup(buttons))
+    await context.bot.send_message(LOG_CHANNEL, f"🔎 User {update.effective_user.id} searched: {query}")
 
-async def Jisshu_start():
-    print('\n')
-    print('Initalizing The Movie Provider Bot')
-    bot_info = await JisshuBot.get_me()
-    JisshuBot.username = bot_info.username
-    await initialize_clients()
-    for name in files:
-        with open(name) as a:
-            patt = Path(a.name)
-            plugin_name = patt.stem.replace(".py", "")
-            plugins_dir = Path(f"plugins/{plugin_name}.py")
-            import_path = "plugins.{}".format(plugin_name)
-            spec = importlib.util.spec_from_file_location(import_path, plugins_dir)
-            load = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(load)
-            sys.modules["plugins." + plugin_name] = load
-            print("The Movie Provider Imported => " + plugin_name)
-    if ON_HEROKU:
-        asyncio.create_task(ping_server())
-    b_users, b_chats = await db.get_banned()
-    temp.BANNED_USERS = b_users
-    temp.BANNED_CHATS = b_chats
-    await Media.ensure_indexes()
-    me = await JisshuBot.get_me()
-    temp.ME = me.id
-    temp.U_NAME = me.username
-    temp.B_NAME = me.first_name
-    JisshuBot.username = '@' + me.username
-    logging.info(f"{me.first_name} with for Pyrogram v{__version__} (Layer {layer}) started on {me.username}.")
-    logging.info(script.LOGO)
-    tz = pytz.timezone('Asia/Kolkata')
-    today = date.today()
-    now = datetime.now(tz)
-    time = now.strftime("%H:%M:%S %p")
-    await JisshuBot.send_message(chat_id=LOG_CHANNEL, text=script.RESTART_TXT.format(today, time))
-    app = web.AppRunner(await web_server())
-    await app.setup()
-    bind_address = "0.0.0.0"
-    await web.TCPSite(app, bind_address, PORT).start()
-    await idle()
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("get_"):
+        file_id = query.data.replace("get_", "")
+        await query.message.reply_document(document=file_id)
+        await context.bot.send_message(LOG_CHANNEL, f"📤 Sent file {file_id} to user {query.from_user.id}")
 
+async def main():
+    await init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, save_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_query))
+    app.add_handler(CallbackQueryHandler(button_click))
+    print("🤖 Bot is running...")
+    await app.run_polling()
 
-if __name__ == '__main__':
-    try:
-        loop.run_until_complete(Jisshu_start())
-    except KeyboardInterrupt:
-        logging.info('Service Stopped Bye 👋')
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
